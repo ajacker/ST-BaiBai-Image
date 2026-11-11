@@ -1,23 +1,23 @@
 /**
  * 从 ComfyUI 拉取模型/LoRA/采样器列表,供简易模式表单做候选。
  *
- * 通道策略与 generateComfyImage 同口径:浏览器直连优先(一次 GET /object_info 拿全,
- * 含 LoRA 与 CLIP);仅网络级失败(CORS/拒连)回退 ST 后端转发。
+ * 通道策略与 generateComfyImage 同口径(见 comfyTransport.ts):
+ * - relay:一次 GET /object_info 由 ST 服务端代发,拿到全量(含 LoRA/CLIP);
+ * - 其余:浏览器直连优先;网络级失败后按 auto 规则试 relay 插件、再退 ST 内置转发。
  *
- * ST 后端只有 /api/sd/comfy/models|samplers|schedulers|vaes 四个端点(都是服务端
- * 拉 /object_info 再摘字段),**没有 loras/clips 端点**——转发通道下这两组降级为空,
- * 表单退化为手输(datalist 无候选),并在状态行说明原因。
+ * ST 内置转发只有 /api/sd/comfy/models|samplers|schedulers|vaes 四个端点(都是服务端
+ * 拉 /object_info 再摘字段),**没有 loras/clips 端点**——该通道下这两组降级为空,
+ * 表单退化为手输(datalist 无候选),并在状态行说明原因。装了 comfy-relay 插件则没有这个缺陷。
  *
  * 列表有 session 级缓存:object_info 完整响应有几 MB,切换预设/重开面板不该反复拉;
  * 用户加了新模型点「刷新」强制重拉。
- *
- * 渠道启用 Basic 认证时同样只走浏览器直连(认证头见 comfyAuth.ts),不回落转发。
  */
 
-import { COMFY_AUTH_NO_RELAY, comfyAuthHeaders, comfyStatusHint } from '@/backends/comfyAuth';
-import { ComfyUIError } from '@/backends/comfyui';
+import { COMFY_AUTH_NO_RELAY, comfyStatusHint } from '@/backends/comfyAuth';
+import { ComfyUIError, ComfyRelayUnavailable } from '@/backends/comfyErrors';
+import { COMFY_DIRECT_UNREACHABLE, comfyFetch } from '@/backends/comfyTransport';
 import { getContext } from '@/st/context';
-import type { ComfyAuthCreds } from '@/state/settings';
+import type { ComfyAuthCreds, ComfyChannel } from '@/state/settings';
 
 export interface ComfyModelLists {
   checkpoints: string[];
@@ -28,8 +28,8 @@ export interface ComfyModelLists {
   loras: string[];
   samplers: string[];
   schedulers: string[];
-  /** 实际打通的通道:browser=拿到了全量;server=转发,loras/clips 为空。 */
-  mode: 'browser' | 'server';
+  /** 实际打通的通道:browser=直连全量;relay=服务端插件全量;server=ST 内置转发,loras/clips 为空。 */
+  mode: 'browser' | 'relay' | 'server';
   fetchedAt: number;
 }
 
@@ -43,10 +43,6 @@ type JsonObject = Record<string, unknown>;
 
 function isObject(value: unknown): value is JsonObject {
   return !!value && typeof value === 'object' && !Array.isArray(value);
-}
-
-function endpoint(base: string, path: string): string {
-  return `${base.trim().replace(/\/+$/, '')}/${path.replace(/^\/+/, '')}`;
 }
 
 function isNetworkError(error: unknown): boolean {
@@ -113,14 +109,11 @@ async function responseError(response: Response, label: string): Promise<ComfyUI
 }
 
 async function fetchViaBrowser(
-  url: string,
-  auth: ComfyAuthCreds | null,
+  conn: { url: string; auth: ComfyAuthCreds | null },
   signal?: AbortSignal,
 ): Promise<ComfyModelLists> {
-  const response = await fetch(endpoint(url, 'object_info'), {
-    headers: comfyAuthHeaders(auth),
-    signal,
-  });
+  // channel 留空 = 直连（comfyFetch 只对 'relay' 分流）
+  const response = await comfyFetch({ ...conn, channel: 'direct' }, 'object_info', { signal });
   if (!response.ok) throw await responseError(response, '读取 ComfyUI 模型列表失败');
   const info = (await response.json()) as JsonObject;
   if (!isObject(info)) throw new ComfyUIError('ComfyUI 返回的 object_info 格式异常');
@@ -158,39 +151,77 @@ async function fetchViaServer(url: string, signal?: AbortSignal): Promise<ComfyM
   };
 }
 
+/** relay 通道:同一份 object_info 由 ST 服务端代发,拿到的是全量(含 LoRA/CLIP)。 */
+async function fetchViaRelay(
+  conn: { url: string; auth: ComfyAuthCreds | null },
+  signal?: AbortSignal,
+): Promise<ComfyModelLists> {
+  const response = await comfyFetch({ ...conn, channel: 'relay' }, 'object_info', { signal });
+  if (!response.ok) throw await responseError(response, '服务端转发读取 ComfyUI 模型列表失败');
+  const info = (await response.json()) as JsonObject;
+  if (!isObject(info)) throw new ComfyUIError('ComfyUI 返回的 object_info 格式异常');
+  return { ...parseObjectInfo(info), mode: 'relay', fetchedAt: Date.now() };
+}
+
 const cache = new Map<string, ComfyModelLists>();
 
 /**
- * 缓存键含凭据:同一地址换账号时列表可能不同(多用户部署),命中旧键会给出别人的模型名。
- * 只存内存、与会话同寿命,不落盘。
+ * 缓存键含凭据与通道:同一地址换账号时列表可能不同(多用户部署),
+ * 换通道时能拿到的集合也不同(内置转发没有 LoRA/CLIP)。只存内存、与会话同寿命,不落盘。
  */
-function cacheKey(url: string, auth: ComfyAuthCreds | null): string {
-  return `${url.trim()}\u0000${auth?.username ?? ''}\u0000${auth?.password ?? ''}`;
+function cacheKey(url: string, auth: ComfyAuthCreds | null, channel: ComfyChannel): string {
+  return `${channel}\u0000${url.trim()}\u0000${auth?.username ?? ''}\u0000${auth?.password ?? ''}`;
 }
 
-/** 拉取列表;同 url+凭据命中缓存直接返回,force 强制重拉(「刷新」按钮)。 */
+/** 拉取列表;同 url+凭据+通道命中缓存直接返回,force 强制重拉(「刷新」按钮)。 */
 export async function fetchComfyModelLists(
   url: string,
-  options?: { force?: boolean; signal?: AbortSignal; auth?: ComfyAuthCreds | null },
+  options?: {
+    force?: boolean;
+    signal?: AbortSignal;
+    auth?: ComfyAuthCreds | null;
+    channel?: ComfyChannel;
+  },
 ): Promise<ComfyModelLists> {
   const key = url.trim();
   if (!key) throw new ComfyUIError('请先填写 ComfyUI 服务地址');
   const auth = options?.auth ?? null;
-  const cacheId = cacheKey(key, auth);
+  const channel = options?.channel ?? 'auto';
+  const cacheId = cacheKey(key, auth, channel);
   if (!options?.force && cache.has(cacheId)) return cache.get(cacheId)!;
 
+  const conn = { url: key, auth };
   let lists: ComfyModelLists;
-  try {
-    lists = await fetchViaBrowser(key, auth, options?.signal);
-  } catch (error) {
-    // 与出图同口径:仅网络级失败回退;HTTP 错误是服务端真实反馈,转发过去结果一样
-    if (!isNetworkError(error)) throw error;
-    // 转发端点不带认证头,启用认证时只能直连(与 comfyui.ts 同口径)
-    if (auth) throw new ComfyUIError(COMFY_AUTH_NO_RELAY);
-    lists = await fetchViaServer(key, options?.signal);
+  if (channel === 'relay') {
+    lists = await fetchViaRelay(conn, options?.signal);
+  } else {
+    try {
+      lists = await fetchViaBrowser(conn, options?.signal);
+    } catch (error) {
+      // 与出图同口径:仅网络级失败换通道;HTTP 错误是服务端真实反馈,换条路结果一样
+      if (!isNetworkError(error)) throw error;
+      lists = await fallbackLists(conn, channel, options?.signal);
+    }
   }
   cache.set(cacheId, lists);
   return lists;
+}
+
+/** auto 的换通道顺序:直连不通 → relay 插件(装了就能用) → ST 内置转发(无认证能力)。 */
+async function fallbackLists(
+  conn: { url: string; auth: ComfyAuthCreds | null },
+  channel: ComfyChannel,
+  signal?: AbortSignal,
+): Promise<ComfyModelLists> {
+  if (channel === 'direct') throw new ComfyUIError(COMFY_DIRECT_UNREACHABLE);
+  try {
+    return await fetchViaRelay(conn, signal);
+  } catch (error) {
+    if (!(error instanceof ComfyRelayUnavailable)) throw error;
+  }
+  // 内置转发端点不带认证头,启用认证时只能走前两条路
+  if (conn.auth) throw new ComfyUIError(COMFY_AUTH_NO_RELAY);
+  return fetchViaServer(conn.url, signal);
 }
 
 /** 测试用:清空缓存。 */

@@ -66,3 +66,30 @@ describe('ComfyUI Basic 认证配置', () => {
     expect(effectiveComfyConn().auth).toBeNull();
   });
 });
+
+describe('ComfyUI 请求通道', () => {
+  beforeEach(() => {
+    vi.resetModules();
+    vi.stubGlobal('toastr', { info: vi.fn(), success: vi.fn(), error: vi.fn() });
+    vi.stubGlobal('window', { addEventListener: vi.fn(), dispatchEvent: vi.fn() });
+  });
+
+  it('存量配置没有 channel → auto', async () => {
+    const { settings, effectiveComfyConn } = await hydrateWithComfy({ url: 'http://comfy.local:8188' });
+    expect(settings.comfyui.channel).toBe('auto');
+    expect(effectiveComfyConn().channel).toBe('auto');
+  });
+
+  it('非法值回落 auto,合法值原样保留', async () => {
+    const { settings } = await hydrateWithComfy({ url: 'http://comfy.local:8188', channel: 'sneaky' });
+    expect(settings.comfyui.channel).toBe('auto');
+
+    vi.resetModules();
+    const { settings: relaySettings, effectiveComfyConn } = await hydrateWithComfy({
+      url: 'http://comfy.local:8188',
+      channel: 'relay',
+    });
+    expect(relaySettings.comfyui.channel).toBe('relay');
+    expect(effectiveComfyConn().channel).toBe('relay');
+  });
+});

@@ -142,6 +142,8 @@ describe('ComfyUI 工作流库迁移', () => {
       url: 'http://example:8188',
       // 存量配置没有 auth 字段 → 未启用,凭据为 null
       auth: null,
+      // 存量配置没有 channel 字段 → auto(改造前的通道行为)
+      channel: 'auto',
       workflow: '{"2":{}}',
       // 存量预设没有 mode/simple 字段 → custom + 简易模式默认值
       mode: 'custom',

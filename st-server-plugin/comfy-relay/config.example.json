@@ -1,0 +1,4 @@
+{
+  "allowedOrigins": ["https://comfyui.example.com"],
+  "timeoutMs": 600000
+}

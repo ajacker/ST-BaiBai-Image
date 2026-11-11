@@ -80,6 +80,8 @@ describe('fetchComfyModelLists', () => {
     const fetchMock = vi.fn(async (input: unknown) => {
       const url = String(input);
       if (url.endsWith('/object_info')) throw new TypeError('Failed to fetch');
+      // comfy-relay 未安装：ST 回 404 且不带 x-comfy-relay-status
+      if (url === '/api/plugins/comfy-relay/proxy') return new Response('not found', { status: 404 });
       if (url.endsWith('/api/sd/comfy/models')) {
         return jsonResponse([
           { value: 'illu.safetensors', text: 'illu' },

@@ -1,8 +1,12 @@
-import { COMFY_AUTH_NO_RELAY, comfyAuthHeaders, comfyStatusHint } from '@/backends/comfyAuth';
+import { COMFY_AUTH_NO_RELAY, comfyStatusHint } from '@/backends/comfyAuth';
+import { ComfyRelayUnavailable, ComfyUIError } from '@/backends/comfyErrors';
+import { COMFY_DIRECT_UNREACHABLE, comfyFetch } from '@/backends/comfyTransport';
 import { buildSimpleWorkflow } from '@/backends/comfyTemplates';
 import { parseSize, pickSize, type Orientation } from '@/backends/size';
 import { getContext } from '@/st/context';
 import { type ComfyRunConn } from '@/state/settings';
+
+export { ComfyRelayUnavailable, ComfyUIError } from '@/backends/comfyErrors';
 
 type JsonObject = Record<string, unknown>;
 export type ComfyWorkflow = Record<string, JsonObject>;
@@ -40,13 +44,6 @@ const POLL_TIMEOUT_MS = 10 * 60 * 1000;
  */
 export function randomSeed(): number {
   return Math.floor(Math.random() * 2 ** 53);
-}
-
-export class ComfyUIError extends Error {
-  constructor(message: string, readonly status?: number) {
-    super(message);
-    this.name = 'ComfyUIError';
-  }
 }
 
 function isObject(value: unknown): value is JsonObject {
@@ -151,10 +148,6 @@ export function renderWorkflowTemplate(template: string, values: ComfyTemplateVa
   }) as ComfyWorkflow;
 }
 
-function endpoint(base: string, path: string): string {
-  return `${base.trim().replace(/\/+$/, '')}/${path.replace(/^\/+/, '')}`;
-}
-
 async function responseError(response: Response, label: string): Promise<ComfyUIError> {
   const text = (await response.text().catch(() => '')).trim();
   const hint = comfyStatusHint(response.status);
@@ -163,15 +156,12 @@ async function responseError(response: Response, label: string): Promise<ComfyUI
 }
 
 /**
- * 请求通道自动选择。策略:
- * 1. 浏览器直连优先(延迟最低,不占 ST 服务端);
- * 2. 仅当请求「根本没送达后端」的网络级失败(fetch TypeError:CORS 拦截/拒连/断网)时,
- *    回退到 ST 后端转发;
- * 3. HTTP 状态错误是服务端真实反馈,不重试——转发过去结果一样;
- * 4. 用户主动取消(AbortError)一律直接抛出。
- * 两个通道都通时「优先浏览器直连」天然成立:直连成功就不试转发,无需探测、无缓存过期问题。
- * 5. 启用 Basic 认证时**不回退**转发:ST 的 /api/sd/comfy/* 只接受 url、不透传认证头,
- *    转发过去必然是 401——不如直接把「直连为什么必须通」讲清楚(见 comfyAuth.ts)。
+ * 通道选择（详见 backends/comfyTransport.ts）。这里是行为约定：
+ * 1. relay：只走 comfy-relay 服务端插件，浏览器不参与，认证由服务端代发；
+ * 2. direct：只走浏览器直连，失败就报可操作的原因（跨域/预检/混合内容）；
+ * 3. auto：直连优先，网络级失败（fetch TypeError）后依次试 relay 插件、ST 内置转发；
+ * 4. HTTP 状态错误是服务端真实反馈，不切换通道——换条路结果一样，重发还会重复生图；
+ * 5. 用户主动取消（AbortError）一律直接抛出。
  */
 function isNetworkError(error: unknown): boolean {
   if (error instanceof DOMException && error.name === 'AbortError') return false;
@@ -185,26 +175,41 @@ function requireContext() {
 }
 
 export interface ComfyTestResult {
-  /** 实际打通的通道:browser=浏览器直连;server=ST 后端转发 */
-  mode: 'browser' | 'server';
+  /** 实际打通的通道:browser=浏览器直连;relay=comfy-relay 服务端插件;server=ST 内置转发 */
+  mode: 'browser' | 'relay' | 'server';
 }
 
 export async function testComfyConnection(conn: ComfyRunConn, signal?: AbortSignal): Promise<ComfyTestResult> {
   if (!conn.url.trim()) throw new ComfyUIError('请先填写 ComfyUI 服务地址');
 
-  // 浏览器直连优先;仅网络级失败(CORS/拒连)才回退 ST 后端转发
+  if (conn.channel === 'relay') {
+    const response = await comfyFetch(conn, 'system_stats', { signal });
+    if (!response.ok) throw await responseError(response, '服务端转发连接 ComfyUI 失败');
+    return { mode: 'relay' };
+  }
+
+  // 浏览器直连优先
   try {
-    const response = await fetch(endpoint(conn.url, 'system_stats'), {
-      headers: comfyAuthHeaders(conn.auth),
-      signal,
-    });
+    const response = await comfyFetch(conn, 'system_stats', { signal });
     if (!response.ok) throw await responseError(response, '浏览器连接 ComfyUI 失败');
     return { mode: 'browser' };
   } catch (error) {
     if (!isNetworkError(error)) throw error;
   }
 
-  // 转发端点没有认证通道:直连不通时给出原因,而不是转发过去再吃一个 401
+  if (conn.channel === 'direct') throw new ComfyUIError(COMFY_DIRECT_UNREACHABLE);
+
+  // auto：直连不通时先试带认证的 relay 插件，插件不在才退 ST 内置转发
+  try {
+    const relayed = { ...conn, channel: 'relay' as const };
+    const response = await comfyFetch(relayed, 'system_stats', { signal });
+    if (!response.ok) throw await responseError(response, '服务端转发连接 ComfyUI 失败');
+    return { mode: 'relay' };
+  } catch (error) {
+    if (!(error instanceof ComfyRelayUnavailable)) throw error;
+  }
+
+  // 内置转发没有认证通道:直连不通时给出原因,而不是转发过去再吃一个 401
   if (conn.auth) throw new ComfyUIError(COMFY_AUTH_NO_RELAY);
 
   const context = requireContext();
@@ -314,12 +319,7 @@ async function queueDirect(
   workflow: ComfyWorkflow,
   signal?: AbortSignal,
 ): Promise<string> {
-  const queued = await fetch(endpoint(conn.url, 'prompt'), {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...comfyAuthHeaders(conn.auth) },
-    body: JSON.stringify({ prompt: workflow }),
-    signal,
-  });
+  const queued = await comfyFetch(conn, 'prompt', { method: 'POST', json: { prompt: workflow }, signal });
   if (!queued.ok) throw await responseError(queued, 'ComfyUI 拒绝了工作流');
   const queuedData = (await queued.json()) as { prompt_id?: unknown; node_errors?: unknown };
   if (typeof queuedData.prompt_id !== 'string' || !queuedData.prompt_id) {
@@ -355,10 +355,7 @@ async function fetchQueuePosition(
   signal?: AbortSignal,
 ): Promise<QueuePosition | null> {
   try {
-    const response = await fetch(endpoint(conn.url, 'queue'), {
-      headers: comfyAuthHeaders(conn.auth),
-      signal,
-    });
+    const response = await comfyFetch(conn, 'queue', { signal });
     if (!response.ok) return null;
     const data = (await response.json()) as JsonObject;
     // 两个键都必须是数组才算有效快照(空数组 = 队列真的空了,是有效信息)。
@@ -400,12 +397,7 @@ async function fetchQueuePosition(
 async function cancelPrompt(conn: ComfyRunConn, promptId: string): Promise<void> {
   // 此处不传 signal:调用方的 signal 正是「已取消」本身,带上会让清理请求当场夭折。
   const position = await fetchQueuePosition(conn, promptId);
-  const post = (path: string, body: JsonObject) =>
-    fetch(endpoint(conn.url, path), {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', ...comfyAuthHeaders(conn.auth) },
-      body: JSON.stringify(body),
-    });
+  const post = (path: string, body: JsonObject) => comfyFetch(conn, path, { method: 'POST', json: body });
 
   try {
     if (position?.running) {
@@ -450,10 +442,7 @@ async function pollDirectResult(
     let watchQueue = !!hooks?.onQueue;
     while (!file) {
       if (Date.now() - startedAt > POLL_TIMEOUT_MS) throw new ComfyUIError('等待 ComfyUI 结果超时（10 分钟）');
-      const historyResponse = await fetch(endpoint(conn.url, `history/${encodeURIComponent(promptId)}`), {
-        headers: comfyAuthHeaders(conn.auth),
-        signal,
-      });
+      const historyResponse = await comfyFetch(conn, `history/${encodeURIComponent(promptId)}`, { signal });
       if (!historyResponse.ok) throw await responseError(historyResponse, '读取 ComfyUI 任务状态失败');
       const history = (await historyResponse.json()) as JsonObject;
       const item = history[promptId];
@@ -477,10 +466,7 @@ async function pollDirectResult(
       subfolder: file.subfolder ?? '',
       type: file.type ?? 'output',
     });
-    const imageResponse = await fetch(`${endpoint(conn.url, 'view')}?${query}`, {
-      headers: comfyAuthHeaders(conn.auth),
-      signal,
-    });
+    const imageResponse = await comfyFetch(conn, `view?${query}`, { signal });
     if (!imageResponse.ok) throw await responseError(imageResponse, '读取 ComfyUI 输出图片失败');
     const blob = await imageResponse.blob();
     const url = URL.createObjectURL(blob);
@@ -528,8 +514,11 @@ export async function generateComfyImage(
     workflow = renderWorkflowTemplate(conn.workflow, { ...values, ...size });
   }
 
-  // 通道自动选择:浏览器直连优先;仅当请求根本没送达 ComfyUI(网络级失败)时回退 ST 后端转发。
-  // 回退只发生在「排队」之前——拿到 prompt_id 后任务已入队,轮询阶段的任何失败都不重发,避免重复生图。
+  // relay 通道:全程走 ST 服务端插件,浏览器不参与(无跨域、无预检)
+  if (conn.channel === 'relay') return runRelay(conn, workflow, signal, hooks);
+
+  // 其余通道:浏览器直连优先;仅当请求根本没送达 ComfyUI(网络级失败)时才换通道。
+  // 换通道只发生在「排队」之前——拿到 prompt_id 后任务已入队,轮询阶段的任何失败都不重发,避免重复生图。
   let queued = false;
   try {
     const promptId = await queueDirect(conn, workflow, signal);
@@ -537,8 +526,35 @@ export async function generateComfyImage(
     return await pollDirectResult(conn, promptId, signal, hooks);
   } catch (error) {
     if (queued || signal?.aborted || !isNetworkError(error)) throw error;
-    // 转发端点没有认证通道,带上凭据也只会吃 401;直接说明原因
+    if (conn.channel === 'direct') throw new ComfyUIError(COMFY_DIRECT_UNREACHABLE);
+
+    // auto:先试带认证的 relay 插件(装了就能用),插件不在才退 ST 内置转发
+    try {
+      return await runRelay(conn, workflow, signal, hooks);
+    } catch (relayError) {
+      // relay 已经排上队之后的失败不能换通道重发,否则会生成两张
+      if (!(relayError instanceof ComfyRelayUnavailable)) throw relayError;
+    }
+
+    // 内置转发没有认证通道,带上凭据也只会吃 401;直接说明原因
     if (conn.auth) throw new ComfyUIError(COMFY_AUTH_NO_RELAY);
     return generateViaServer(conn, workflow, signal);
   }
+}
+
+/**
+ * 整条流程走 relay：排队 → 轮询 → 取图都由 ST 服务端代发。
+ *
+ * 排队成功之后的任何失败都必须原样抛出：此时任务已经在 ComfyUI 队列里，
+ * 换个通道重发等于再排一张，用户会白烧一次 GPU。
+ */
+async function runRelay(
+  conn: ComfyRunConn,
+  workflow: ComfyWorkflow,
+  signal?: AbortSignal,
+  hooks?: ComfyProgressHooks,
+): Promise<ComfyImageResult> {
+  const relayed = { ...conn, channel: 'relay' as const };
+  const promptId = await queueDirect(relayed, workflow, signal);
+  return pollDirectResult(relayed, promptId, signal, hooks);
 }

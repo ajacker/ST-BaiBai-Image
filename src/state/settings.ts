@@ -92,6 +92,8 @@ export interface ComfyRunConn extends SizePair {
   url: string;
   /** Basic 认证凭据;未启用/没填用户名时为 null(见 effectiveComfyConn)。 */
   auth: ComfyAuthCreds | null;
+  /** 请求通道;见 backends/comfyTransport.ts。 */
+  channel: ComfyChannel;
   workflow: string;
   mode: ComfyPresetMode;
   simple: ComfySimpleConfig;
@@ -101,14 +103,22 @@ export interface ComfyRunConn extends SizePair {
  * ComfyUI 可选 Basic 认证。渠道级而非预设级:凭据属于「这台服务器」,
  * 与 url 同理(见 ComfyWorkflowPreset 上方的说明)。
  *
- * 只管浏览器直连通道:ST 后端的 /api/sd/comfy/* 转发端点只接受 url,
- * 不带也不透传认证头,所以启用后不再回退转发(见 backends/comfyAuth.ts)。
+ * 认证能否发出取决于通道(见 ComfyChannel):浏览器直连受同源策略约束,
+ * 服务端转发由 ST 代发,不参与 CORS。
  */
 export interface ComfyBasicAuth {
   enabled: boolean;
   username: string;
   password: string;
 }
+
+/**
+ * 请求通道:
+ * - auto:浏览器直连优先,网络级失败后依次试 relay 插件、ST 内置转发;
+ * - direct:只走浏览器直连(要求 ComfyUI 允许跨域、认证层放行 OPTIONS 预检);
+ * - relay:只走 comfy-relay 服务端插件,浏览器不参与,可带认证。
+ */
+export type ComfyChannel = 'auto' | 'direct' | 'relay';
 
 /** 真正要发出去的凭据对(用户名非空且已启用才存在)。 */
 export type ComfyAuthCreds = Pick<ComfyBasicAuth, 'username' | 'password'>;
@@ -117,6 +127,8 @@ export type ComfyAuthCreds = Pick<ComfyBasicAuth, 'username' | 'password'>;
 export interface ComfyUISettings extends BackendConn {
   /** Basic 认证(可选);默认关闭,不影响未加认证的存量配置。 */
   auth: ComfyBasicAuth;
+  /** 请求通道;存量配置没有该字段时按 auto(= 改造前的行为)。 */
+  channel: ComfyChannel;
   /** 工作流库。**不变式:恒非空**(至少一条,见 normalizeComfyUI 收尾兜底)。 */
   workflows: ComfyWorkflowPreset[];
   /** 当前使用的工作流 id;指向已删条目时由 normalize 回落到第一条。 */
@@ -1128,6 +1140,7 @@ function comfyDefaults(): ComfyUISettings {
   return {
     ...backendDefaults('http://127.0.0.1:8188'),
     auth: comfyAuthDefaults(),
+    channel: 'auto',
     workflows: [preset],
     activeWorkflowId: preset.id,
   };
@@ -1337,6 +1350,7 @@ export function effectiveComfyConn(): ComfyRunConn {
   return {
     url: settings.comfyui.url,
     auth: comfyAuthCreds(settings.comfyui.auth),
+    channel: settings.comfyui.channel,
     workflow: preset.workflow,
     mode: preset.mode,
     simple: preset.simple,
@@ -1475,6 +1489,10 @@ function normalizeComfyAuth(raw: unknown): ComfyBasicAuth {
   };
 }
 
+function normalizeComfyChannel(raw: unknown): ComfyChannel {
+  return raw === 'direct' || raw === 'relay' ? raw : 'auto';
+}
+
 function normalizeComfyUI(raw: unknown, def: ComfyUISettings): ComfyUISettings {
   const conn = normalizeBackend(raw, def);
   const o = (raw ?? {}) as Partial<ComfyUISettings>;
@@ -1491,7 +1509,13 @@ function normalizeComfyUI(raw: unknown, def: ComfyUISettings): ComfyUISettings {
       ? o.activeWorkflowId
       : workflows[0].id;
 
-  return { ...conn, auth: normalizeComfyAuth(o.auth), workflows, activeWorkflowId };
+  return {
+    ...conn,
+    auth: normalizeComfyAuth(o.auth),
+    channel: normalizeComfyChannel(o.channel),
+    workflows,
+    activeWorkflowId,
+  };
 }
 
 const NAI_MODEL_VALUES = new Set<string>(NAI_MODELS.map(m => m.value));

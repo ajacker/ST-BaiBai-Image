@@ -32,13 +32,13 @@ import {
   newComfyWorkflow,
   ORIENTATION_LOCKS,
   settings,
+  type ComfyChannel,
 } from '@/state/settings';
 import { computed, nextTick, ref, watch } from 'vue';
 
 const testing = ref(false);
 /** 密码框默认掩码;「显示」按钮只切输入框类型,不改存储值。 */
-const showAuthPassword = ref(false);
-const configuring = ref(false);
+const showAuthPassword = ref(false);const configuring = ref(false);
 const assistOpen = ref(false);
 const assistDraft = ref('');
 const assistResult = ref<WorkflowAssistResult | null>(null);
@@ -48,6 +48,25 @@ const confirmDeleteOpen = ref(false);
 
 /** 本渠道是否为当前出图渠道;「使用此渠道」按钮与设置页选择器、页签徽标同属一个开关。 */
 const inUse = computed(() => settings.defaultBackend === 'comfyui');
+
+/* ============ 请求通道 ============ */
+
+const channelOptions: Array<{ value: ComfyChannel; label: string }> = [
+  { value: 'auto', label: '自动' },
+  { value: 'direct', label: '仅直连' },
+  { value: 'relay', label: '服务端转发' },
+];
+
+const channelHint = computed(() => {
+  switch (settings.comfyui.channel) {
+    case 'direct':
+      return '只走浏览器直连：ComfyUI 必须允许跨域（--enable-cors-header）；若前面有 Basic 认证，认证层还必须放行 OPTIONS 预检（预检不带凭据）。';
+    case 'relay':
+      return '所有请求由 SillyTavern 服务端代发，浏览器不参与——不受跨域、预检、混合内容限制，也能带 Basic 认证。需要先安装 comfy-relay 服务端插件并开启 enableServerPlugins。';
+    default:
+      return '浏览器直连优先；直连被跨域/网络拦下时，依次尝试 comfy-relay 服务端插件、ST 内置转发。装了插件后无需任何额外配置。';
+  }
+});
 
 /* ============ 工作流库 ============ */
 
@@ -149,17 +168,20 @@ async function onFetchModels(silent = false) {
   fetching.value = true;
   fetchError.value = '';
   try {
+    const conn = effectiveComfyConn();
     lists.value = await fetchComfyModelLists(settings.comfyui.url, {
       force: !!lists.value,
-      auth: effectiveComfyConn().auth,
+      auth: conn.auth,
+      channel: conn.channel,
     });
     if (!silent) {
-      toastr.success(
+      const label =
         lists.value.mode === 'server'
-          ? '已拉取模型列表(ST 转发;LoRA/CLIP 需手输文件名)'
-          : '已拉取模型列表',
-        '柏宝绘',
-      );
+          ? '已拉取模型列表(ST 内置转发;LoRA/CLIP 需手输文件名)'
+          : lists.value.mode === 'relay'
+            ? '已拉取模型列表（服务端转发）'
+            : '已拉取模型列表';
+      toastr.success(label, '柏宝绘');
     }
   } catch (error) {
     fetchError.value = errorMessage(error);
@@ -184,8 +206,8 @@ watch(
 // 转发模式要提醒 LoRA/CLIP 拿不到;失败要留原因。手动点按钮的正反馈由 toastr 负责。
 const fetchStatus = computed(() => {
   if (fetchError.value) return `拉取失败:${fetchError.value}`;
-  if (!lists.value || lists.value.mode === 'browser') return '';
-  return 'ST 转发拿不到 LoRA/CLIP 列表,这两项需手输(ComfyUI 加 --enable-cors-header 可直连)';
+  if (!lists.value || lists.value.mode !== 'server') return '';
+  return 'ST 内置转发拿不到 LoRA/CLIP 列表,这两项需手输(装 comfy-relay 插件或给 ComfyUI 加 --enable-cors-header 可直连)';
 });
 
 const modelOptions = computed(() => {
@@ -295,7 +317,13 @@ async function onTestConnection() {
   testing.value = true;
   try {
     const result = await testComfyConnection(effectiveComfyConn());
-    toastr.success(result.mode === 'server' ? 'ComfyUI 连接正常（ST 后端转发）' : 'ComfyUI 连接正常（浏览器直连）');
+    const label =
+      result.mode === 'relay'
+        ? 'ComfyUI 连接正常（服务端转发）'
+        : result.mode === 'server'
+          ? 'ComfyUI 连接正常（ST 内置转发）'
+          : 'ComfyUI 连接正常（浏览器直连）';
+    toastr.success(label);
   } catch (error) {
     toastr.error(errorMessage(error), 'ComfyUI 连接失败');
   } finally {
@@ -375,14 +403,35 @@ function applyAssist() {
           />
         </div>
 
+        <!-- 请求通道:直连 / 服务端转发。认证与跨域的解法全在这一格。 -->
+        <div class="bbi-select-row">
+          <span class="bbi-field-label">请求通道</span>
+          <div class="bbi-segmented" role="tablist" aria-label="ComfyUI 请求通道">
+            <button
+              v-for="opt in channelOptions"
+              :key="opt.value"
+              class="bbi-seg"
+              :class="{ 'is-on': settings.comfyui.channel === opt.value }"
+              type="button"
+              role="tab"
+              :aria-selected="settings.comfyui.channel === opt.value"
+              @click="settings.comfyui.channel = opt.value"
+            >
+              {{ opt.label }}
+            </button>
+          </div>
+        </div>
+        <p class="bbi-field-hint wf-switch-hint">{{ channelHint }}</p>
+
         <!-- Basic 认证:可选,默认关闭。凭据属渠道级(一台服务器一套)。 -->
         <label class="bbi-switch-row">
           <span class="bbi-field-label">Basic 认证</span>
           <input v-model="settings.comfyui.auth.enabled" type="checkbox" class="bbi-checkbox" />
         </label>
         <p class="bbi-field-hint wf-switch-hint">
-          ComfyUI 前面挂了 Basic 认证（反向代理的 auth_basic 等）时勾选。认证只随浏览器直连发出——
-          ST 后端转发接口不带认证头，所以开启后需要 ComfyUI 允许跨域直连（启动参数 --enable-cors-header）。
+          ComfyUI 前面挂了 Basic 认证（反向代理的 auth_basic 等）时勾选。
+          「服务端转发」通道由 ST 服务端带认证发请求，不受浏览器跨域与预检限制；
+          「仅直连」通道则要求认证层放行 OPTIONS 预检（预检不带凭据）。
         </p>
 
         <template v-if="settings.comfyui.auth.enabled">
