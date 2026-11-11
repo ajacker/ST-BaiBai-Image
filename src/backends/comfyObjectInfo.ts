@@ -10,10 +10,14 @@
  *
  * 列表有 session 级缓存:object_info 完整响应有几 MB,切换预设/重开面板不该反复拉;
  * 用户加了新模型点「刷新」强制重拉。
+ *
+ * 渠道启用 Basic 认证时同样只走浏览器直连(认证头见 comfyAuth.ts),不回落转发。
  */
 
+import { COMFY_AUTH_NO_RELAY, comfyAuthHeaders, comfyStatusHint } from '@/backends/comfyAuth';
 import { ComfyUIError } from '@/backends/comfyui';
 import { getContext } from '@/st/context';
+import type { ComfyAuthCreds } from '@/state/settings';
 
 export interface ComfyModelLists {
   checkpoints: string[];
@@ -103,11 +107,20 @@ function stringArray(data: unknown): string[] {
 
 async function responseError(response: Response, label: string): Promise<ComfyUIError> {
   const text = (await response.text().catch(() => '')).trim();
-  return new ComfyUIError(`${label} (${response.status})${text ? `：${text.slice(0, 300)}` : ''}`, response.status);
+  const hint = comfyStatusHint(response.status);
+  const detail = [hint, text.slice(0, 300)].filter(Boolean).join('；');
+  return new ComfyUIError(`${label} (${response.status})${detail ? `：${detail}` : ''}`, response.status);
 }
 
-async function fetchViaBrowser(url: string, signal?: AbortSignal): Promise<ComfyModelLists> {
-  const response = await fetch(endpoint(url, 'object_info'), { signal });
+async function fetchViaBrowser(
+  url: string,
+  auth: ComfyAuthCreds | null,
+  signal?: AbortSignal,
+): Promise<ComfyModelLists> {
+  const response = await fetch(endpoint(url, 'object_info'), {
+    headers: comfyAuthHeaders(auth),
+    signal,
+  });
   if (!response.ok) throw await responseError(response, '读取 ComfyUI 模型列表失败');
   const info = (await response.json()) as JsonObject;
   if (!isObject(info)) throw new ComfyUIError('ComfyUI 返回的 object_info 格式异常');
@@ -147,24 +160,36 @@ async function fetchViaServer(url: string, signal?: AbortSignal): Promise<ComfyM
 
 const cache = new Map<string, ComfyModelLists>();
 
-/** 拉取列表;同 url 命中缓存直接返回,force 强制重拉(「刷新」按钮)。 */
+/**
+ * 缓存键含凭据:同一地址换账号时列表可能不同(多用户部署),命中旧键会给出别人的模型名。
+ * 只存内存、与会话同寿命,不落盘。
+ */
+function cacheKey(url: string, auth: ComfyAuthCreds | null): string {
+  return `${url.trim()}\u0000${auth?.username ?? ''}\u0000${auth?.password ?? ''}`;
+}
+
+/** 拉取列表;同 url+凭据命中缓存直接返回,force 强制重拉(「刷新」按钮)。 */
 export async function fetchComfyModelLists(
   url: string,
-  options?: { force?: boolean; signal?: AbortSignal },
+  options?: { force?: boolean; signal?: AbortSignal; auth?: ComfyAuthCreds | null },
 ): Promise<ComfyModelLists> {
   const key = url.trim();
   if (!key) throw new ComfyUIError('请先填写 ComfyUI 服务地址');
-  if (!options?.force && cache.has(key)) return cache.get(key)!;
+  const auth = options?.auth ?? null;
+  const cacheId = cacheKey(key, auth);
+  if (!options?.force && cache.has(cacheId)) return cache.get(cacheId)!;
 
   let lists: ComfyModelLists;
   try {
-    lists = await fetchViaBrowser(key, options?.signal);
+    lists = await fetchViaBrowser(key, auth, options?.signal);
   } catch (error) {
     // 与出图同口径:仅网络级失败回退;HTTP 错误是服务端真实反馈,转发过去结果一样
     if (!isNetworkError(error)) throw error;
+    // 转发端点不带认证头,启用认证时只能直连(与 comfyui.ts 同口径)
+    if (auth) throw new ComfyUIError(COMFY_AUTH_NO_RELAY);
     lists = await fetchViaServer(key, options?.signal);
   }
-  cache.set(key, lists);
+  cache.set(cacheId, lists);
   return lists;
 }
 

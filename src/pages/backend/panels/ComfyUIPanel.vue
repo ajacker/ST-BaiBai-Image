@@ -36,6 +36,8 @@ import {
 import { computed, nextTick, ref, watch } from 'vue';
 
 const testing = ref(false);
+/** 密码框默认掩码;「显示」按钮只切输入框类型,不改存储值。 */
+const showAuthPassword = ref(false);
 const configuring = ref(false);
 const assistOpen = ref(false);
 const assistDraft = ref('');
@@ -147,7 +149,10 @@ async function onFetchModels(silent = false) {
   fetching.value = true;
   fetchError.value = '';
   try {
-    lists.value = await fetchComfyModelLists(settings.comfyui.url, { force: !!lists.value });
+    lists.value = await fetchComfyModelLists(settings.comfyui.url, {
+      force: !!lists.value,
+      auth: effectiveComfyConn().auth,
+    });
     if (!silent) {
       toastr.success(
         lists.value.mode === 'server'
@@ -369,6 +374,52 @@ function applyAssist() {
             spellcheck="false"
           />
         </div>
+
+        <!-- Basic 认证:可选,默认关闭。凭据属渠道级(一台服务器一套)。 -->
+        <label class="bbi-switch-row">
+          <span class="bbi-field-label">Basic 认证</span>
+          <input v-model="settings.comfyui.auth.enabled" type="checkbox" class="bbi-checkbox" />
+        </label>
+        <p class="bbi-field-hint wf-switch-hint">
+          ComfyUI 前面挂了 Basic 认证（反向代理的 auth_basic 等）时勾选。认证只随浏览器直连发出——
+          ST 后端转发接口不带认证头，所以开启后需要 ComfyUI 允许跨域直连（启动参数 --enable-cors-header）。
+        </p>
+
+        <template v-if="settings.comfyui.auth.enabled">
+          <div class="api-row">
+            <span class="bbi-field-label">用户名</span>
+            <input
+              class="bbi-input"
+              type="text"
+              v-model="settings.comfyui.auth.username"
+              placeholder="用户名"
+              autocomplete="username"
+              spellcheck="false"
+            />
+          </div>
+          <div class="api-row">
+            <span class="bbi-field-label">密码</span>
+            <input
+              class="bbi-input"
+              :type="showAuthPassword ? 'text' : 'password'"
+              v-model="settings.comfyui.auth.password"
+              placeholder="密码（允许为空）"
+              autocomplete="current-password"
+              spellcheck="false"
+            />
+            <button
+              class="bbi-btn bbi-btn-sm"
+              type="button"
+              :aria-pressed="showAuthPassword"
+              @click="showAuthPassword = !showAuthPassword"
+            >
+              {{ showAuthPassword ? '隐藏' : '显示' }}
+            </button>
+          </div>
+          <p v-if="!settings.comfyui.auth.username.trim()" class="bbi-field-hint wf-switch-hint">
+            用户名留空时不发认证头，等于没开。
+          </p>
+        </template>
 
         <div class="conn-actions">
           <span v-if="inUse" class="conn-inuse"><Icon name="check" :size="13" /> 当前出图渠道</span>

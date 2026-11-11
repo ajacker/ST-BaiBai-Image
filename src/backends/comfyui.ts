@@ -1,3 +1,4 @@
+import { COMFY_AUTH_NO_RELAY, comfyAuthHeaders, comfyStatusHint } from '@/backends/comfyAuth';
 import { buildSimpleWorkflow } from '@/backends/comfyTemplates';
 import { parseSize, pickSize, type Orientation } from '@/backends/size';
 import { getContext } from '@/st/context';
@@ -156,7 +157,9 @@ function endpoint(base: string, path: string): string {
 
 async function responseError(response: Response, label: string): Promise<ComfyUIError> {
   const text = (await response.text().catch(() => '')).trim();
-  return new ComfyUIError(`${label} (${response.status})${text ? `：${text.slice(0, 500)}` : ''}`, response.status);
+  const hint = comfyStatusHint(response.status);
+  const detail = [hint, text.slice(0, 500)].filter(Boolean).join('；');
+  return new ComfyUIError(`${label} (${response.status})${detail ? `：${detail}` : ''}`, response.status);
 }
 
 /**
@@ -167,6 +170,8 @@ async function responseError(response: Response, label: string): Promise<ComfyUI
  * 3. HTTP 状态错误是服务端真实反馈,不重试——转发过去结果一样;
  * 4. 用户主动取消(AbortError)一律直接抛出。
  * 两个通道都通时「优先浏览器直连」天然成立:直连成功就不试转发,无需探测、无缓存过期问题。
+ * 5. 启用 Basic 认证时**不回退**转发:ST 的 /api/sd/comfy/* 只接受 url、不透传认证头,
+ *    转发过去必然是 401——不如直接把「直连为什么必须通」讲清楚(见 comfyAuth.ts)。
  */
 function isNetworkError(error: unknown): boolean {
   if (error instanceof DOMException && error.name === 'AbortError') return false;
@@ -189,12 +194,18 @@ export async function testComfyConnection(conn: ComfyRunConn, signal?: AbortSign
 
   // 浏览器直连优先;仅网络级失败(CORS/拒连)才回退 ST 后端转发
   try {
-    const response = await fetch(endpoint(conn.url, 'system_stats'), { signal });
+    const response = await fetch(endpoint(conn.url, 'system_stats'), {
+      headers: comfyAuthHeaders(conn.auth),
+      signal,
+    });
     if (!response.ok) throw await responseError(response, '浏览器连接 ComfyUI 失败');
     return { mode: 'browser' };
   } catch (error) {
     if (!isNetworkError(error)) throw error;
   }
+
+  // 转发端点没有认证通道:直连不通时给出原因,而不是转发过去再吃一个 401
+  if (conn.auth) throw new ComfyUIError(COMFY_AUTH_NO_RELAY);
 
   const context = requireContext();
   const response = await fetch(`${SERVER_BASE}/ping`, {
@@ -305,7 +316,7 @@ async function queueDirect(
 ): Promise<string> {
   const queued = await fetch(endpoint(conn.url, 'prompt'), {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', ...comfyAuthHeaders(conn.auth) },
     body: JSON.stringify({ prompt: workflow }),
     signal,
   });
@@ -344,7 +355,10 @@ async function fetchQueuePosition(
   signal?: AbortSignal,
 ): Promise<QueuePosition | null> {
   try {
-    const response = await fetch(endpoint(conn.url, 'queue'), { signal });
+    const response = await fetch(endpoint(conn.url, 'queue'), {
+      headers: comfyAuthHeaders(conn.auth),
+      signal,
+    });
     if (!response.ok) return null;
     const data = (await response.json()) as JsonObject;
     // 两个键都必须是数组才算有效快照(空数组 = 队列真的空了,是有效信息)。
@@ -389,7 +403,7 @@ async function cancelPrompt(conn: ComfyRunConn, promptId: string): Promise<void>
   const post = (path: string, body: JsonObject) =>
     fetch(endpoint(conn.url, path), {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...comfyAuthHeaders(conn.auth) },
       body: JSON.stringify(body),
     });
 
@@ -436,7 +450,10 @@ async function pollDirectResult(
     let watchQueue = !!hooks?.onQueue;
     while (!file) {
       if (Date.now() - startedAt > POLL_TIMEOUT_MS) throw new ComfyUIError('等待 ComfyUI 结果超时（10 分钟）');
-      const historyResponse = await fetch(endpoint(conn.url, `history/${encodeURIComponent(promptId)}`), { signal });
+      const historyResponse = await fetch(endpoint(conn.url, `history/${encodeURIComponent(promptId)}`), {
+        headers: comfyAuthHeaders(conn.auth),
+        signal,
+      });
       if (!historyResponse.ok) throw await responseError(historyResponse, '读取 ComfyUI 任务状态失败');
       const history = (await historyResponse.json()) as JsonObject;
       const item = history[promptId];
@@ -460,7 +477,10 @@ async function pollDirectResult(
       subfolder: file.subfolder ?? '',
       type: file.type ?? 'output',
     });
-    const imageResponse = await fetch(`${endpoint(conn.url, 'view')}?${query}`, { signal });
+    const imageResponse = await fetch(`${endpoint(conn.url, 'view')}?${query}`, {
+      headers: comfyAuthHeaders(conn.auth),
+      signal,
+    });
     if (!imageResponse.ok) throw await responseError(imageResponse, '读取 ComfyUI 输出图片失败');
     const blob = await imageResponse.blob();
     const url = URL.createObjectURL(blob);
@@ -517,6 +537,8 @@ export async function generateComfyImage(
     return await pollDirectResult(conn, promptId, signal, hooks);
   } catch (error) {
     if (queued || signal?.aborted || !isNetworkError(error)) throw error;
+    // 转发端点没有认证通道,带上凭据也只会吃 401;直接说明原因
+    if (conn.auth) throw new ComfyUIError(COMFY_AUTH_NO_RELAY);
     return generateViaServer(conn, workflow, signal);
   }
 }

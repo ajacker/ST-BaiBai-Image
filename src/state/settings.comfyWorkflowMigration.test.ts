@@ -140,6 +140,8 @@ describe('ComfyUI 工作流库迁移', () => {
     const { simpleDefaults } = await import('@/backends/comfyTemplates');
     expect(effectiveComfyConn()).toEqual({
       url: 'http://example:8188',
+      // 存量配置没有 auth 字段 → 未启用,凭据为 null
+      auth: null,
       workflow: '{"2":{}}',
       // 存量预设没有 mode/simple 字段 → custom + 简易模式默认值
       mode: 'custom',

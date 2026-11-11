@@ -90,13 +90,33 @@ export interface ComfyWorkflowPreset extends SizePair {
  */
 export interface ComfyRunConn extends SizePair {
   url: string;
+  /** Basic 认证凭据;未启用/没填用户名时为 null(见 effectiveComfyConn)。 */
+  auth: ComfyAuthCreds | null;
   workflow: string;
   mode: ComfyPresetMode;
   simple: ComfySimpleConfig;
 }
 
+/**
+ * ComfyUI 可选 Basic 认证。渠道级而非预设级:凭据属于「这台服务器」,
+ * 与 url 同理(见 ComfyWorkflowPreset 上方的说明)。
+ *
+ * 只管浏览器直连通道:ST 后端的 /api/sd/comfy/* 转发端点只接受 url,
+ * 不带也不透传认证头,所以启用后不再回退转发(见 backends/comfyAuth.ts)。
+ */
+export interface ComfyBasicAuth {
+  enabled: boolean;
+  username: string;
+  password: string;
+}
+
+/** 真正要发出去的凭据对(用户名非空且已启用才存在)。 */
+export type ComfyAuthCreds = Pick<ComfyBasicAuth, 'username' | 'password'>;
+
 /** ComfyUI 连接与工作流库。 */
 export interface ComfyUISettings extends BackendConn {
+  /** Basic 认证(可选);默认关闭,不影响未加认证的存量配置。 */
+  auth: ComfyBasicAuth;
   /** 工作流库。**不变式:恒非空**(至少一条,见 normalizeComfyUI 收尾兜底)。 */
   workflows: ComfyWorkflowPreset[];
   /** 当前使用的工作流 id;指向已删条目时由 normalize 回落到第一条。 */
@@ -1094,6 +1114,10 @@ export function newComfyWorkflow(name = DEFAULT_WORKFLOW_NAME): ComfyWorkflowPre
   };
 }
 
+function comfyAuthDefaults(): ComfyBasicAuth {
+  return { enabled: false, username: '', password: '' };
+}
+
 /**
  * 新装即带一条空预设,而不是空库。
  * 只用一套工作流的人不该被迫先「新建」才有地方粘 JSON——手感与改造前的单文本框完全一致,
@@ -1103,6 +1127,7 @@ function comfyDefaults(): ComfyUISettings {
   const preset = newComfyWorkflow();
   return {
     ...backendDefaults('http://127.0.0.1:8188'),
+    auth: comfyAuthDefaults(),
     workflows: [preset],
     activeWorkflowId: preset.id,
   };
@@ -1293,13 +1318,25 @@ export function activeOrientationLock(): OrientationLock {
 }
 
 /**
- * 出图/测试连接用的 conn:渠道级 url + 当前预设的工作流与横竖尺寸。
+ * 从渠道配置里取出真正要发的凭据。
+ *
+ * 用户名空 = 没配好 = 不发认证头(否则会发出 "Basic OnNlY3JldA==" 这种空用户名凭据,
+ * 服务器只会回 401,报错信息反而更难懂)。密码允许为空:Basic 规范里空密码合法。
+ */
+export function comfyAuthCreds(auth: ComfyBasicAuth): ComfyAuthCreds | null {
+  const username = auth.username.trim();
+  return auth.enabled && username ? { username, password: auth.password } : null;
+}
+
+/**
+ * 出图/测试连接用的 conn:渠道级 url 与认证 + 当前预设的工作流与横竖尺寸。
  * backends/comfyui.ts 只吃这个形状,不关心库里还有几套。
  */
 export function effectiveComfyConn(): ComfyRunConn {
   const preset = activeComfyPreset();
   return {
     url: settings.comfyui.url,
+    auth: comfyAuthCreds(settings.comfyui.auth),
     workflow: preset.workflow,
     mode: preset.mode,
     simple: preset.simple,
@@ -1425,6 +1462,19 @@ function foldLegacyWorkflow(o: Partial<ComfyUISettings>, conn: BackendConn): Com
   };
 }
 
+/**
+ * Basic 认证清洗:缺字段/类型不符回退默认(关闭 + 空凭据)。
+ * 只做形状清洗,不修剪密码——密码里的空格是用户自己填的,裁剪等于改密码。
+ */
+function normalizeComfyAuth(raw: unknown): ComfyBasicAuth {
+  const o = (raw ?? {}) as Partial<ComfyBasicAuth>;
+  return {
+    enabled: o.enabled === true,
+    username: typeof o.username === 'string' ? o.username : '',
+    password: typeof o.password === 'string' ? o.password : '',
+  };
+}
+
 function normalizeComfyUI(raw: unknown, def: ComfyUISettings): ComfyUISettings {
   const conn = normalizeBackend(raw, def);
   const o = (raw ?? {}) as Partial<ComfyUISettings>;
@@ -1441,7 +1491,7 @@ function normalizeComfyUI(raw: unknown, def: ComfyUISettings): ComfyUISettings {
       ? o.activeWorkflowId
       : workflows[0].id;
 
-  return { ...conn, workflows, activeWorkflowId };
+  return { ...conn, auth: normalizeComfyAuth(o.auth), workflows, activeWorkflowId };
 }
 
 const NAI_MODEL_VALUES = new Set<string>(NAI_MODELS.map(m => m.value));
