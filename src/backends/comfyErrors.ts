@@ -24,3 +24,14 @@ export class ComfyRelayUnavailable extends ComfyUIError {
     this.name = 'ComfyRelayUnavailable';
   }
 }
+
+/**
+ * ST 自带的 CORS 代理没开（config.yaml 的 enableCorsProxy: false，自带路由回 404）。
+ * 同样是「通道不可用」，可以安全回退。
+ */
+export class ComfyProxyUnavailable extends ComfyUIError {
+  constructor(message: string, status?: number) {
+    super(message, status);
+    this.name = 'ComfyProxyUnavailable';
+  }
+}

@@ -1,20 +1,18 @@
 /**
- * 从 ComfyUI 拉取模型/LoRA/采样器列表,供简易模式表单做候选。
- *
  * 通道策略与 generateComfyImage 同口径(见 comfyTransport.ts):
- * - relay:一次 GET /object_info 由 ST 服务端代发,拿到全量(含 LoRA/CLIP);
- * - 其余:浏览器直连优先;网络级失败后按 auto 规则试 relay 插件、再退 ST 内置转发。
+ * - proxy / relay:一次 GET /object_info 由 ST 代发,拿到全量(含 LoRA/CLIP);
+ * - 其余:浏览器直连优先;网络级失败后按 auto 规则试 ST 代理、relay 插件、再退 ST 内置转发。
  *
  * ST 内置转发只有 /api/sd/comfy/models|samplers|schedulers|vaes 四个端点(都是服务端
  * 拉 /object_info 再摘字段),**没有 loras/clips 端点**——该通道下这两组降级为空,
- * 表单退化为手输(datalist 无候选),并在状态行说明原因。装了 comfy-relay 插件则没有这个缺陷。
+ * 表单退化为手输(datalist 无候选),并在状态行说明原因。走 proxy/relay 则没有这个缺陷。
  *
  * 列表有 session 级缓存:object_info 完整响应有几 MB,切换预设/重开面板不该反复拉;
  * 用户加了新模型点「刷新」强制重拉。
  */
 
 import { COMFY_AUTH_NO_RELAY, comfyStatusHint } from '@/backends/comfyAuth';
-import { ComfyUIError, ComfyRelayUnavailable } from '@/backends/comfyErrors';
+import { ComfyProxyUnavailable, ComfyUIError, ComfyRelayUnavailable } from '@/backends/comfyErrors';
 import { COMFY_DIRECT_UNREACHABLE, comfyFetch } from '@/backends/comfyTransport';
 import { getContext } from '@/st/context';
 import type { ComfyAuthCreds, ComfyChannel } from '@/state/settings';
@@ -28,8 +26,8 @@ export interface ComfyModelLists {
   loras: string[];
   samplers: string[];
   schedulers: string[];
-  /** 实际打通的通道:browser=直连全量;relay=服务端插件全量;server=ST 内置转发,loras/clips 为空。 */
-  mode: 'browser' | 'relay' | 'server';
+  /** 实际打通的通道:browser=直连全量;proxy/relay=服务端代发全量;server=ST 内置转发,loras/clips 为空。 */
+  mode: 'browser' | 'proxy' | 'relay' | 'server';
   fetchedAt: number;
 }
 
@@ -151,16 +149,17 @@ async function fetchViaServer(url: string, signal?: AbortSignal): Promise<ComfyM
   };
 }
 
-/** relay 通道:同一份 object_info 由 ST 服务端代发,拿到的是全量(含 LoRA/CLIP)。 */
-async function fetchViaRelay(
+/** 服务端通道(proxy/relay):同一份 object_info 由 ST 代发,拿到的是全量(含 LoRA/CLIP)。 */
+async function fetchViaServerSide(
   conn: { url: string; auth: ComfyAuthCreds | null },
+  channel: 'proxy' | 'relay',
   signal?: AbortSignal,
 ): Promise<ComfyModelLists> {
-  const response = await comfyFetch({ ...conn, channel: 'relay' }, 'object_info', { signal });
+  const response = await comfyFetch({ ...conn, channel }, 'object_info', { signal });
   if (!response.ok) throw await responseError(response, '服务端转发读取 ComfyUI 模型列表失败');
   const info = (await response.json()) as JsonObject;
   if (!isObject(info)) throw new ComfyUIError('ComfyUI 返回的 object_info 格式异常');
-  return { ...parseObjectInfo(info), mode: 'relay', fetchedAt: Date.now() };
+  return { ...parseObjectInfo(info), mode: channel, fetchedAt: Date.now() };
 }
 
 const cache = new Map<string, ComfyModelLists>();
@@ -192,8 +191,8 @@ export async function fetchComfyModelLists(
 
   const conn = { url: key, auth };
   let lists: ComfyModelLists;
-  if (channel === 'relay') {
-    lists = await fetchViaRelay(conn, options?.signal);
+  if (channel === 'proxy' || channel === 'relay') {
+    lists = await fetchViaServerSide(conn, channel, options?.signal);
   } else {
     try {
       lists = await fetchViaBrowser(conn, options?.signal);
@@ -207,19 +206,21 @@ export async function fetchComfyModelLists(
   return lists;
 }
 
-/** auto 的换通道顺序:直连不通 → relay 插件(装了就能用) → ST 内置转发(无认证能力)。 */
+/** auto 的换通道顺序:直连不通 → ST 代理(零安装) → relay 插件 → ST 内置转发(无认证能力)。 */
 async function fallbackLists(
   conn: { url: string; auth: ComfyAuthCreds | null },
   channel: ComfyChannel,
   signal?: AbortSignal,
 ): Promise<ComfyModelLists> {
   if (channel === 'direct') throw new ComfyUIError(COMFY_DIRECT_UNREACHABLE);
-  try {
-    return await fetchViaRelay(conn, signal);
-  } catch (error) {
-    if (!(error instanceof ComfyRelayUnavailable)) throw error;
+  for (const next of ['proxy', 'relay'] as const) {
+    try {
+      return await fetchViaServerSide(conn, next, signal);
+    } catch (error) {
+      if (!(error instanceof ComfyRelayUnavailable) && !(error instanceof ComfyProxyUnavailable)) throw error;
+    }
   }
-  // 内置转发端点不带认证头,启用认证时只能走前两条路
+  // 内置转发端点不带认证头,启用认证时只能走前面几条路
   if (conn.auth) throw new ComfyUIError(COMFY_AUTH_NO_RELAY);
   return fetchViaServer(conn.url, signal);
 }

@@ -114,11 +114,12 @@ export interface ComfyBasicAuth {
 
 /**
  * 请求通道:
- * - auto:浏览器直连优先,网络级失败后依次试 relay 插件、ST 内置转发;
+ * - auto:浏览器直连优先,网络级失败后依次试 proxy、relay、ST 内置转发;
  * - direct:只走浏览器直连(要求 ComfyUI 允许跨域、认证层放行 OPTIONS 预检);
- * - relay:只走 comfy-relay 服务端插件,浏览器不参与,可带认证。
+ * - proxy:走 ST 自带的 CORS 代理(/proxy/<URL>,需 enableCorsProxy),同源、带认证、不用装插件;
+ * - relay:走 comfy-relay 服务端插件(需 enableServerPlugins),同源、带认证、可加源白名单。
  */
-export type ComfyChannel = 'auto' | 'direct' | 'relay';
+export type ComfyChannel = 'auto' | 'direct' | 'proxy' | 'relay';
 
 /** 真正要发出去的凭据对(用户名非空且已启用才存在)。 */
 export type ComfyAuthCreds = Pick<ComfyBasicAuth, 'username' | 'password'>;
@@ -1490,7 +1491,7 @@ function normalizeComfyAuth(raw: unknown): ComfyBasicAuth {
 }
 
 function normalizeComfyChannel(raw: unknown): ComfyChannel {
-  return raw === 'direct' || raw === 'relay' ? raw : 'auto';
+  return raw === 'direct' || raw === 'proxy' || raw === 'relay' ? raw : 'auto';
 }
 
 function normalizeComfyUI(raw: unknown, def: ComfyUISettings): ComfyUISettings {

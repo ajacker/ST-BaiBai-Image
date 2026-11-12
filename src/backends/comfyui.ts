@@ -1,5 +1,5 @@
 import { COMFY_AUTH_NO_RELAY, comfyStatusHint } from '@/backends/comfyAuth';
-import { ComfyRelayUnavailable, ComfyUIError } from '@/backends/comfyErrors';
+import { ComfyProxyUnavailable, ComfyRelayUnavailable, ComfyUIError } from '@/backends/comfyErrors';
 import { COMFY_DIRECT_UNREACHABLE, comfyFetch } from '@/backends/comfyTransport';
 import { buildSimpleWorkflow } from '@/backends/comfyTemplates';
 import { parseSize, pickSize, type Orientation } from '@/backends/size';
@@ -157,9 +157,9 @@ async function responseError(response: Response, label: string): Promise<ComfyUI
 
 /**
  * 通道选择（详见 backends/comfyTransport.ts）。这里是行为约定：
- * 1. relay：只走 comfy-relay 服务端插件，浏览器不参与，认证由服务端代发；
+ * 1. proxy / relay：请求由 ST 服务端代发，浏览器不参与，认证由服务端带；
  * 2. direct：只走浏览器直连，失败就报可操作的原因（跨域/预检/混合内容）；
- * 3. auto：直连优先，网络级失败（fetch TypeError）后依次试 relay 插件、ST 内置转发；
+ * 3. auto：直连优先，网络级失败（fetch TypeError）后依次试 ST 代理、relay 插件、ST 内置转发；
  * 4. HTTP 状态错误是服务端真实反馈，不切换通道——换条路结果一样，重发还会重复生图；
  * 5. 用户主动取消（AbortError）一律直接抛出。
  */
@@ -175,17 +175,17 @@ function requireContext() {
 }
 
 export interface ComfyTestResult {
-  /** 实际打通的通道:browser=浏览器直连;relay=comfy-relay 服务端插件;server=ST 内置转发 */
-  mode: 'browser' | 'relay' | 'server';
+  /** 实际打通的通道:browser=浏览器直连;proxy=ST 自带 CORS 代理;relay=comfy-relay 插件;server=ST 内置转发 */
+  mode: 'browser' | 'proxy' | 'relay' | 'server';
 }
 
 export async function testComfyConnection(conn: ComfyRunConn, signal?: AbortSignal): Promise<ComfyTestResult> {
   if (!conn.url.trim()) throw new ComfyUIError('请先填写 ComfyUI 服务地址');
 
-  if (conn.channel === 'relay') {
+  if (conn.channel !== 'auto' && conn.channel !== 'direct') {
     const response = await comfyFetch(conn, 'system_stats', { signal });
     if (!response.ok) throw await responseError(response, '服务端转发连接 ComfyUI 失败');
-    return { mode: 'relay' };
+    return { mode: conn.channel };
   }
 
   // 浏览器直连优先
@@ -199,14 +199,16 @@ export async function testComfyConnection(conn: ComfyRunConn, signal?: AbortSign
 
   if (conn.channel === 'direct') throw new ComfyUIError(COMFY_DIRECT_UNREACHABLE);
 
-  // auto：直连不通时先试带认证的 relay 插件，插件不在才退 ST 内置转发
-  try {
-    const relayed = { ...conn, channel: 'relay' as const };
-    const response = await comfyFetch(relayed, 'system_stats', { signal });
-    if (!response.ok) throw await responseError(response, '服务端转发连接 ComfyUI 失败');
-    return { mode: 'relay' };
-  } catch (error) {
-    if (!(error instanceof ComfyRelayUnavailable)) throw error;
+  // auto：直连不通时依次试 ST 代理、relay 插件，都不可用才退 ST 内置转发
+  for (const channel of ['proxy', 'relay'] as const) {
+    try {
+      const relayed = { ...conn, channel };
+      const response = await comfyFetch(relayed, 'system_stats', { signal });
+      if (!response.ok) throw await responseError(response, '服务端转发连接 ComfyUI 失败');
+      return { mode: channel };
+    } catch (error) {
+      if (!(error instanceof ComfyRelayUnavailable) && !(error instanceof ComfyProxyUnavailable)) throw error;
+    }
   }
 
   // 内置转发没有认证通道:直连不通时给出原因,而不是转发过去再吃一个 401
@@ -514,8 +516,10 @@ export async function generateComfyImage(
     workflow = renderWorkflowTemplate(conn.workflow, { ...values, ...size });
   }
 
-  // relay 通道:全程走 ST 服务端插件,浏览器不参与(无跨域、无预检)
-  if (conn.channel === 'relay') return runRelay(conn, workflow, signal, hooks);
+  // 服务端通道:全程由 ST 代发,浏览器不参与(无跨域、无预检)
+  if (conn.channel === 'proxy' || conn.channel === 'relay') {
+    return runServerSide(conn, conn.channel, workflow, signal, hooks);
+  }
 
   // 其余通道:浏览器直连优先;仅当请求根本没送达 ComfyUI(网络级失败)时才换通道。
   // 换通道只发生在「排队」之前——拿到 prompt_id 后任务已入队,轮询阶段的任何失败都不重发,避免重复生图。
@@ -528,12 +532,16 @@ export async function generateComfyImage(
     if (queued || signal?.aborted || !isNetworkError(error)) throw error;
     if (conn.channel === 'direct') throw new ComfyUIError(COMFY_DIRECT_UNREACHABLE);
 
-    // auto:先试带认证的 relay 插件(装了就能用),插件不在才退 ST 内置转发
-    try {
-      return await runRelay(conn, workflow, signal, hooks);
-    } catch (relayError) {
-      // relay 已经排上队之后的失败不能换通道重发,否则会生成两张
-      if (!(relayError instanceof ComfyRelayUnavailable)) throw relayError;
+    // auto:先 ST 代理(零安装),再 relay 插件,最后才是 ST 内置转发
+    for (const channel of ['proxy', 'relay'] as const) {
+      try {
+        return await runServerSide(conn, channel, workflow, signal, hooks);
+      } catch (fallbackError) {
+        // 已经排上队之后的失败不能换通道重发,否则会生成两张
+        if (!(fallbackError instanceof ComfyRelayUnavailable) && !(fallbackError instanceof ComfyProxyUnavailable)) {
+          throw fallbackError;
+        }
+      }
     }
 
     // 内置转发没有认证通道,带上凭据也只会吃 401;直接说明原因
@@ -543,18 +551,20 @@ export async function generateComfyImage(
 }
 
 /**
- * 整条流程走 relay：排队 → 轮询 → 取图都由 ST 服务端代发。
+ * 整条流程走服务端通道（ST 代理或 relay 插件）：排队 → 轮询 → 取图都由 ST 代发。
  *
  * 排队成功之后的任何失败都必须原样抛出：此时任务已经在 ComfyUI 队列里，
  * 换个通道重发等于再排一张，用户会白烧一次 GPU。
+ * （队列若已排上，抛出的也不会是 *Unavailable —— 那两类只会在首次请求时出现。）
  */
-async function runRelay(
+async function runServerSide(
   conn: ComfyRunConn,
+  channel: 'proxy' | 'relay',
   workflow: ComfyWorkflow,
   signal?: AbortSignal,
   hooks?: ComfyProgressHooks,
 ): Promise<ComfyImageResult> {
-  const relayed = { ...conn, channel: 'relay' as const };
-  const promptId = await queueDirect(relayed, workflow, signal);
-  return pollDirectResult(relayed, promptId, signal, hooks);
+  const viaServer = { ...conn, channel };
+  const promptId = await queueDirect(viaServer, workflow, signal);
+  return pollDirectResult(viaServer, promptId, signal, hooks);
 }

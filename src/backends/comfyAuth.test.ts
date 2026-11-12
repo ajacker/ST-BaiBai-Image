@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { COMFY_AUTH_NO_RELAY, comfyAuthHeaders, comfyStatusHint } from '@/backends/comfyAuth';
 import { clearComfyModelListsCache, fetchComfyModelLists } from '@/backends/comfyObjectInfo';
-import { COMFY_RELAY_MISSING } from '@/backends/comfyTransport';
+import { COMFY_PROXY_DISABLED, COMFY_RELAY_MISSING } from '@/backends/comfyTransport';
 import { generateComfyImage, testComfyConnection } from '@/backends/comfyui';
 
 vi.mock('@/st/context', () => ({
@@ -21,7 +21,10 @@ const TEMPLATE = JSON.stringify({ '3': { class_type: 'KSampler', inputs: { text:
 const AUTH = { username: 'user', password: 'pass' };
 const RELAY_PATH = '/api/plugins/comfy-relay/proxy';
 
-type ConnOverrides = Partial<{ auth: { username: string; password: string } | null; channel: 'auto' | 'direct' | 'relay' }>;
+type ConnOverrides = Partial<{
+  auth: { username: string; password: string } | null;
+  channel: 'auto' | 'direct' | 'proxy' | 'relay';
+}>;
 
 function connWith(overrides: ConnOverrides = {}) {
   return {
@@ -45,6 +48,15 @@ function decodeBasic(header: string): string {
 /** 未安装 comfy-relay 时 ST 的真实回应：404 且不带 x-comfy-relay-status。 */
 function relayMissingResponse(): Response {
   return new Response('<html>Cannot POST /api/plugins/comfy-relay/proxy</html>', { status: 404 });
+}
+
+/** enableCorsProxy: false 时 ST 的真实回应。 */
+function proxyDisabledResponse(): Response {
+  return new Response('CORS proxy is disabled. Enable it in config.yaml or use the --corsProxy flag.', { status: 404 });
+}
+
+function isProxyUrl(url: string): boolean {
+  return url.startsWith('proxy/');
 }
 
 describe('comfyAuthHeaders', () => {
@@ -243,14 +255,119 @@ describe('服务端转发通道（comfy-relay）', () => {
   });
 });
 
+describe('ST 自带 CORS 代理通道（enableCorsProxy）', () => {
+  it('目标 URL 整体编码进路径;认证头由浏览器带过去,由 ST 转发', async () => {
+    const calls: Array<{ url: string; headers: Record<string, string>; body?: string }> = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: unknown, init?: { headers?: Record<string, string>; body?: string }) => {
+        const url = String(input);
+        calls.push({ url, headers: init?.headers ?? {}, body: init?.body });
+        if (url.includes('system_stats')) {
+          return new Response(JSON.stringify({ system: { comfyui_version: '0.44.0' } }), { status: 200 });
+        }
+        throw new Error(`unexpected ${url}`);
+      }),
+    );
+
+    await expect(testComfyConnection(connWith({ auth: AUTH, channel: 'proxy' }))).resolves.toEqual({ mode: 'proxy' });
+
+    const target = 'http://comfy.local:8188/system_stats';
+    expect(calls[0].url).toBe(`proxy/${encodeURIComponent(target)}`);
+    // 查询串必须编码在路径里，否则会被 ST 当成自己的 query 吃掉
+    expect(calls[0].url).not.toContain('?');
+    expect(calls[0].headers.Authorization).toBe('Basic dXNlcjpwYXNz');
+  });
+
+  it('生图全程走代理:排队/取图都带认证,POST 有 JSON 体', async () => {
+    const calls: Array<{ url: string; method?: string; headers: Record<string, string>; body?: string }> = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: unknown, init?: { method?: string; headers?: Record<string, string>; body?: string }) => {
+        const url = String(input);
+        calls.push({ url, method: init?.method, headers: init?.headers ?? {}, body: init?.body });
+        const decoded = decodeURIComponent(url.replace(/^proxy\//, ''));
+        if (decoded.endsWith('/prompt')) {
+          return new Response(JSON.stringify({ prompt_id: 'pid-1' }), { status: 200 });
+        }
+        if (decoded.includes('/history/')) {
+          return new Response(
+            JSON.stringify({
+              'pid-1': { status: { completed: true }, outputs: { '8': { images: [{ filename: 'a.png' }] } } },
+            }),
+            { status: 200 },
+          );
+        }
+        if (decoded.includes('/view')) {
+          return new Response(new Blob(['png'], { type: 'image/png' }), { status: 200 });
+        }
+        return new Response('{}', { status: 200 });
+      }),
+    );
+
+    const result = await generateComfyImage(connWith({ auth: AUTH, channel: 'proxy' }), { prompt: '1girl', seed: 1 });
+    expect(result.filename).toBe('a.png');
+
+    const queue = calls.find(c => decodeURIComponent(c.url.replace(/^proxy\//, '')).endsWith('/prompt'));
+    expect(queue?.method).toBe('POST');
+    expect(queue?.headers.Authorization).toBe('Basic dXNlcjpwYXNz');
+    expect(JSON.parse(String(queue?.body))).toHaveProperty('prompt');
+    expect(calls.every(c => c.headers.Authorization === 'Basic dXNlcjpwYXNz')).toBe(true);
+    result.revoke();
+  });
+
+  it('encodeCorsProxy 未开启（404 + 固定文案）→ 报可操作的配置原因', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (input: unknown) => {
+      if (isProxyUrl(String(input))) return proxyDisabledResponse();
+      throw new TypeError('Failed to fetch');
+    }));
+    await expect(
+      generateComfyImage(connWith({ auth: AUTH, channel: 'proxy' }), { prompt: '1girl', seed: 1 }),
+    ).rejects.toThrow(COMFY_PROXY_DISABLED);
+  });
+});
+
 describe('auto 通道的换通道顺序', () => {
-  it('直连网络失败 → 自动用上 relay 插件（装了插件即生效,无需改配置）', async () => {
+  it('ST 代理开着 → 直连失败后直接用它（不需要装插件）', async () => {
+    const seen: string[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: unknown) => {
+        const url = String(input);
+        seen.push(url);
+        if (isProxyUrl(url)) {
+          const decoded = decodeURIComponent(url.replace(/^proxy\//, ''));
+          if (decoded.endsWith('/prompt')) return new Response(JSON.stringify({ prompt_id: 'pid-1' }), { status: 200 });
+          if (decoded.includes('/history/')) {
+            return new Response(
+              JSON.stringify({
+                'pid-1': { status: { completed: true }, outputs: { '8': { images: [{ filename: 'a.png' }] } } },
+              }),
+              { status: 200 },
+            );
+          }
+          return new Response(new Blob(['png']), { status: 200 });
+        }
+        throw new TypeError('Failed to fetch');
+      }),
+    );
+
+    const result = await generateComfyImage(connWith({ auth: AUTH, channel: 'auto' }), { prompt: '1girl', seed: 1 });
+    expect(result.filename).toBe('a.png');
+    expect(seen[0]).toBe('http://comfy.local:8188/prompt');
+    expect(isProxyUrl(seen[1])).toBe(true);
+    expect(seen).not.toContain(RELAY_PATH);
+    result.revoke();
+  });
+
+  it('代理没开 → 自动用上 relay 插件', async () => {
     const seen: string[] = [];
     vi.stubGlobal(
       'fetch',
       vi.fn(async (input: unknown, init?: { body?: string }) => {
         const url = String(input);
         seen.push(url);
+        if (isProxyUrl(url)) return proxyDisabledResponse();
         if (url === RELAY_PATH) {
           const body = JSON.parse(String(init?.body));
           if (body.path === 'prompt') {
@@ -258,9 +375,6 @@ describe('auto 通道的换通道顺序', () => {
               status: 200,
               headers: { 'x-comfy-relay-status': '200' },
             });
-          }
-          if (body.path === 'system_stats') {
-            return new Response('{}', { status: 200, headers: { 'x-comfy-relay-status': '200' } });
           }
           if (String(body.path).startsWith('history/')) {
             return new Response(
@@ -279,15 +393,18 @@ describe('auto 通道的换通道顺序', () => {
     const result = await generateComfyImage(connWith({ auth: AUTH, channel: 'auto' }), { prompt: '1girl', seed: 1 });
     expect(result.filename).toBe('a.png');
     expect(seen[0]).toBe('http://comfy.local:8188/prompt'); // 先直连
-    expect(seen[1]).toBe(RELAY_PATH); // 失败后走插件
+    expect(isProxyUrl(seen[1])).toBe(true); // 再试 ST 代理
+    expect(seen[2]).toBe(RELAY_PATH); // 代理没开才用插件
     result.revoke();
   });
 
-  it('插件没装且启用认证 → 报「内置转发不带认证」的原因', async () => {
+  it('两条服务端通道都没有且启用认证 → 报「内置转发不带认证」的原因', async () => {
     vi.stubGlobal(
       'fetch',
       vi.fn(async (input: unknown) => {
-        if (String(input) === RELAY_PATH) return relayMissingResponse();
+        const url = String(input);
+        if (url === RELAY_PATH) return relayMissingResponse();
+        if (isProxyUrl(url)) return proxyDisabledResponse();
         throw new TypeError('Failed to fetch');
       }),
     );
@@ -296,12 +413,13 @@ describe('auto 通道的换通道顺序', () => {
     ).rejects.toThrow(COMFY_AUTH_NO_RELAY);
   });
 
-  it('插件没装且未启用认证 → 回退 ST 内置转发（改造前行为不变）', async () => {
+  it('两条服务端通道都没有且未启用认证 → 回退 ST 内置转发（改造前行为不变）', async () => {
     vi.stubGlobal(
       'fetch',
       vi.fn(async (input: unknown) => {
         const url = String(input);
         if (url === RELAY_PATH) return relayMissingResponse();
+        if (isProxyUrl(url)) return proxyDisabledResponse();
         if (url.endsWith('/api/sd/comfy/generate')) {
           return new Response(JSON.stringify({ format: 'png', data: 'AAAA' }), { status: 200 });
         }

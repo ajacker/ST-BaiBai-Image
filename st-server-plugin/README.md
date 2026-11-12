@@ -11,7 +11,11 @@ Response to preflight request doesn't pass access control check:
 No 'Access-Control-Allow-Origin' header is present on the requested resource.
 ```
 
-这个插件把请求搬到 ST 服务端发出：浏览器只访问同源的 `/api/plugins/comfy-relay/proxy`（无预检），认证头由服务端拼。因此**不需要改 nginx、不需要给 ComfyUI 开跨域、也不受混合内容限制**。
+**先看有没有更省事的路**：SillyTavern 自带的 CORS 代理（`config.yaml` 的 `enableCorsProxy: true`）也能干同样的事，而且不用装任何东西——插件面板里选「ST 代理」即可。本插件适用于：
+
+- 不希望开全局 `/proxy/`（那等于把 ST 变成对任何来源开放的转发器）；
+- 想给转发目标加白名单（`config.json` 的 `allowedOrigins`）；
+- 想自己控制超时、日志等细节。
 
 为什么不用 ST 自带的 `/api/sd/comfy/*`：那组端点（`src/endpoints/stable-diffusion.js`）是裸 `fetch(url)`，不带也不透传认证头（同文件的 webui 端点倒是有 `getBasicAuthHeader(request.body.auth)`），对有认证的 ComfyUI 无解。
 
@@ -34,7 +38,7 @@ No 'Access-Control-Allow-Origin' header is present on the requested resource.
    Initializing plugin from .../plugins/comfy-relay/index.js
    [comfy-relay] 路由已注册：POST /api/plugins/comfy-relay/proxy
    ```
-4. 「柏宝绘」→ 渠道 → ComfyUI → **请求通道**选「服务端转发」（或「自动」，直连失败时会自动用上它）。
+4. 「柏宝绘」→ 渠道 → ComfyUI → **请求通道**选「插件转发」（或「自动」，直连失败时会自动用上它）。
 
 ## 可选配置 `config.json`
 

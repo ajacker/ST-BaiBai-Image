@@ -80,7 +80,8 @@ describe('fetchComfyModelLists', () => {
     const fetchMock = vi.fn(async (input: unknown) => {
       const url = String(input);
       if (url.endsWith('/object_info')) throw new TypeError('Failed to fetch');
-      // comfy-relay 未安装：ST 回 404 且不带 x-comfy-relay-status
+      // 两条服务端通道都不可用：CORS 代理没开 + comfy-relay 没装
+      if (url.startsWith('proxy/')) return new Response('CORS proxy is disabled.', { status: 404 });
       if (url === '/api/plugins/comfy-relay/proxy') return new Response('not found', { status: 404 });
       if (url.endsWith('/api/sd/comfy/models')) {
         return jsonResponse([

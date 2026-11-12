@@ -54,17 +54,20 @@ const inUse = computed(() => settings.defaultBackend === 'comfyui');
 const channelOptions: Array<{ value: ComfyChannel; label: string }> = [
   { value: 'auto', label: '自动' },
   { value: 'direct', label: '仅直连' },
-  { value: 'relay', label: '服务端转发' },
+  { value: 'proxy', label: 'ST 代理' },
+  { value: 'relay', label: '插件转发' },
 ];
 
 const channelHint = computed(() => {
   switch (settings.comfyui.channel) {
     case 'direct':
       return '只走浏览器直连：ComfyUI 必须允许跨域（--enable-cors-header）；若前面有 Basic 认证，认证层还必须放行 OPTIONS 预检（预检不带凭据）。';
+    case 'proxy':
+      return '走 ST 自带的 CORS 代理：浏览器只访问同源路径，请求头（含 Basic 认证）、方法、请求体由 ST 服务端转发给 ComfyUI。需要在 config.yaml 里设 enableCorsProxy: true 并重启，不需要装任何插件。';
     case 'relay':
-      return '所有请求由 SillyTavern 服务端代发，浏览器不参与——不受跨域、预检、混合内容限制，也能带 Basic 认证。需要先安装 comfy-relay 服务端插件并开启 enableServerPlugins。';
+      return '走 comfy-relay 服务端插件：同样由 ST 代发，但可限制目标源白名单、不必开全局代理。需要把插件拷到 SillyTavern/plugins/ 并设 enableServerPlugins: true。';
     default:
-      return '浏览器直连优先；直连被跨域/网络拦下时，依次尝试 comfy-relay 服务端插件、ST 内置转发。装了插件后无需任何额外配置。';
+      return '浏览器直连优先；直连被跨域/网络拦下时，依次尝试 ST 代理（enableCorsProxy）、插件转发、ST 内置转发。其中前两者都能带认证。';
   }
 });
 
@@ -178,7 +181,7 @@ async function onFetchModels(silent = false) {
       const label =
         lists.value.mode === 'server'
           ? '已拉取模型列表(ST 内置转发;LoRA/CLIP 需手输文件名)'
-          : lists.value.mode === 'relay'
+          : lists.value.mode === 'proxy' || lists.value.mode === 'relay'
             ? '已拉取模型列表（服务端转发）'
             : '已拉取模型列表';
       toastr.success(label, '柏宝绘');
@@ -318,11 +321,13 @@ async function onTestConnection() {
   try {
     const result = await testComfyConnection(effectiveComfyConn());
     const label =
-      result.mode === 'relay'
-        ? 'ComfyUI 连接正常（服务端转发）'
-        : result.mode === 'server'
-          ? 'ComfyUI 连接正常（ST 内置转发）'
-          : 'ComfyUI 连接正常（浏览器直连）';
+      result.mode === 'proxy'
+        ? 'ComfyUI 连接正常（ST 代理）'
+        : result.mode === 'relay'
+          ? 'ComfyUI 连接正常（插件转发）'
+          : result.mode === 'server'
+            ? 'ComfyUI 连接正常（ST 内置转发）'
+            : 'ComfyUI 连接正常（浏览器直连）';
     toastr.success(label);
   } catch (error) {
     toastr.error(errorMessage(error), 'ComfyUI 连接失败');
@@ -430,8 +435,8 @@ function applyAssist() {
         </label>
         <p class="bbi-field-hint wf-switch-hint">
           ComfyUI 前面挂了 Basic 认证（反向代理的 auth_basic 等）时勾选。
-          「服务端转发」通道由 ST 服务端带认证发请求，不受浏览器跨域与预检限制；
-          「仅直连」通道则要求认证层放行 OPTIONS 预检（预检不带凭据）。
+          「ST 代理」「插件转发」由 ST 服务端带认证发请求，不受浏览器跨域与预检限制（注意 ST 代理会把上游 401 改写成 400）；
+          「仅直连」则要求认证层放行 OPTIONS 预检（预检不带凭据）。
         </p>
 
         <template v-if="settings.comfyui.auth.enabled">
